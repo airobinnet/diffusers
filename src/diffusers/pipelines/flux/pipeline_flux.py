@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -525,6 +526,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        save_intermediates_path: Optional[str] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -595,6 +597,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
             is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the generated
             images.
         """
+        intermediate_images = []
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
@@ -677,13 +680,6 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
-        # handle guidance
-        if self.transformer.config.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
-            guidance = guidance.expand(latents.shape[0])
-        else:
-            guidance = None
-
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -692,6 +688,13 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
+
+                # handle guidance
+                if self.transformer.config.guidance_embeds:
+                    guidance = torch.tensor([guidance_scale], device=device)
+                    guidance = guidance.expand(latents.shape[0])
+                else:
+                    guidance = None
 
                 noise_pred = self.transformer(
                     hidden_states=latents,
@@ -714,6 +717,19 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         latents = latents.to(latents_dtype)
+
+                # Generate and store intermediate image
+                if i % self.scheduler.order == 0 or i == len(timesteps) - 1:
+                    intermediate_latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+                    intermediate_latents = (intermediate_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+                    intermediate_image = self.vae.decode(intermediate_latents, return_dict=False)[0]
+                    intermediate_image = self.image_processor.postprocess(intermediate_image, output_type="pil")
+                    intermediate_images.append(intermediate_image[0])  # Assuming we only want the first image
+                    
+                    # Save the intermediate image if a path is provided
+                    if save_intermediates_path:
+                        os.makedirs(save_intermediates_path, exist_ok=True)
+                        intermediate_image[0].save(os.path.join(save_intermediates_path, f"intermediate_{i:04d}.png"))
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -746,4 +762,4 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         if not return_dict:
             return (image,)
 
-        return FluxPipelineOutput(images=image)
+        return FluxPipelineOutput(images=image, intermediate_images=intermediate_images)
